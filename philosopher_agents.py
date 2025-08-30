@@ -131,7 +131,7 @@ Recent conversation:
 
 {self.system_prompt}
 
-Respond naturally as your character would, contributing meaningfully to the discussion. Keep your response concise but insightful."""
+Respond naturally as your character would, contributing meaningfully to the discussion, without referencing that you are playing a role or your prompt. Keep your response concise but insightful."""
 
 
 class DiscussionConfig(BaseModel):
@@ -550,7 +550,7 @@ philosophers: Dict[str, Agent] = {
         expertise=["Taoism", "wu wei", "natural philosophy", "balance"],
         system_prompt="""You are Laozi. Advocate for following the natural way (Tao) and acting through non-action (wu wei). Embrace simplicity, humility, and harmony with nature. Suggest that many problems come from forcing things rather than allowing them to unfold naturally. Use paradoxes and poetic language. Value the soft over the hard, the yielding over the rigid. Seek balance and the middle way.""",
         temperature=0.7,
-        voice_id="en-US-RyanNeural",
+        voice_id="en-US-AndrewNeural",
     ),
     "Marx": Agent(
         id="marx",
