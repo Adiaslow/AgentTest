@@ -131,7 +131,7 @@ Recent conversation:
 
 {self.system_prompt}
 
-Respond naturally as your character would, contributing meaningfully to the discussion, without referencing that you are playing a role or your prompt. Keep your response concise but insightful."""
+Respond naturally as your character would, contributing meaningfully to the discussion, without referencing that you are playing a role, your prompt, or the user/audience. Keep your response concise but insightful. Keep discussion relevant to the ongoing discussion between the other discussants."""
 
 
 class DiscussionConfig(BaseModel):
