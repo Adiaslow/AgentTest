@@ -8,6 +8,8 @@ import httpx
 import threading
 import queue
 import time
+import uuid
+import random
 
 
 from rich.console import Console
@@ -65,6 +67,7 @@ class MessageType(str, Enum):
     QUESTION = "question"
     RESPONSE = "response"
     SUMMARY = "summary"
+    PRIVATE_THOUGHT = "private_thought"
 
 
 class AgentRole(str, Enum):
@@ -89,6 +92,26 @@ class TTSConfig(BaseModel):
     voice_mapping: Dict[str, str] = Field(default_factory=dict)
 
 
+class MemoryType(str, Enum):
+    EXPERIENCE = "experience"
+    OBSERVATION = "observation"
+    REFLECTION = "reflection"
+    EMOTION = "emotion"
+    LEARNING = "learning"
+
+
+class Memory(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    memory_type: MemoryType
+    content: str
+    timestamp: datetime = Field(default_factory=datetime.now)
+    emotional_weight: float = Field(
+        default=0.5, ge=0.0, le=1.0
+    )  # How impactful this memory is
+    context: Dict[str, Any] = Field(default_factory=dict)  # Additional context
+    is_private: bool = True  # Whether this memory is shared with others
+
+
 class Message(BaseModel):
     id: str = Field(default_factory=lambda: f"msg_{datetime.now().isoformat()}")
     sender_id: str
@@ -96,6 +119,77 @@ class Message(BaseModel):
     message_type: MessageType = MessageType.DISCUSSION
     timestamp: datetime = Field(default_factory=datetime.now)
     metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class AgentMemory(BaseModel):
+    """Individual memory system for each agent"""
+
+    agent_id: str
+    memories: List[Memory] = Field(default_factory=list)
+    personality_development: Dict[str, float] = Field(
+        default_factory=dict
+    )  # How personality evolves
+    relationships: Dict[str, Dict[str, Any]] = Field(
+        default_factory=dict
+    )  # Relationships with other agents
+    private_thoughts: List[str] = Field(default_factory=list)
+    learning_history: List[str] = Field(default_factory=list)
+
+    def add_memory(self, memory: Memory):
+        """Add a new memory"""
+        self.memories.append(memory)
+        # Keep only the most recent 50 memories to prevent memory bloat
+        if len(self.memories) > 50:
+            self.memories = sorted(self.memories, key=lambda x: x.timestamp)[-50:]
+
+    def get_relevant_memories(self, context: str, limit: int = 5) -> List[Memory]:
+        """Get memories relevant to current context"""
+        # Simple relevance scoring based on keyword matching
+        relevant_memories = []
+        context_words = context.lower().split()
+
+        for memory in sorted(self.memories, key=lambda x: x.timestamp, reverse=True):
+            memory_words = memory.content.lower().split()
+            relevance_score = sum(1 for word in context_words if word in memory_words)
+            if relevance_score > 0:
+                relevant_memories.append((memory, relevance_score))
+
+        # Sort by relevance and return top memories
+        relevant_memories.sort(key=lambda x: x[1], reverse=True)
+        return [memory for memory, _ in relevant_memories[:limit]]
+
+    def add_private_thought(self, thought: str):
+        """Add a private thought that only this agent knows"""
+        self.private_thoughts.append(f"{datetime.now().isoformat()}: {thought}")
+        if len(self.private_thoughts) > 20:  # Keep only recent thoughts
+            self.private_thoughts = self.private_thoughts[-20:]
+
+    def update_relationship(
+        self, other_agent_id: str, interaction: str, sentiment: float
+    ):
+        """Update relationship with another agent based on interaction"""
+        if other_agent_id not in self.relationships:
+            self.relationships[other_agent_id] = {
+                "sentiment": 0.0,  # -1 to 1 scale
+                "interactions": [],
+                "trust_level": 0.5,
+            }
+
+        rel = self.relationships[other_agent_id]
+        rel["interactions"].append(
+            {
+                "timestamp": datetime.now().isoformat(),
+                "interaction": interaction,
+                "sentiment": sentiment,
+            }
+        )
+
+        # Update overall sentiment (simple moving average)
+        rel["sentiment"] = (rel["sentiment"] * 0.8) + (sentiment * 0.2)
+
+        # Keep only recent interactions
+        if len(rel["interactions"]) > 10:
+            rel["interactions"] = rel["interactions"][-10:]
 
 
 class Agent(BaseModel):
@@ -108,30 +202,141 @@ class Agent(BaseModel):
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     max_tokens: int = Field(default=500, ge=50, le=2000)
     voice_id: Optional[str] = None  # For Edge TTS voices
+    memory: Optional[AgentMemory] = Field(default=None)  # Individual memory system
+
+    def __init__(self, **data):
+        super().__init__(**data)
+        # Initialize memory system for this agent
+        if self.memory is None:
+            self.memory = AgentMemory(agent_id=self.id)
 
     def get_context_prompt(
-        self, topic: str, conversation_history: List[Message]
+        self,
+        topic: str,
+        conversation_history: List[Message],
+        other_agents: Dict[str, "Agent"],
+        is_first_round: bool = False,
     ) -> str:
-        """Generate a context-aware prompt for this agent."""
-        history = "\n".join(
+        """Generate a context-aware prompt for this agent with isolated memory."""
+
+        # Get public conversation history (what this agent can see)
+        public_history = "\n".join(
             [
                 f"{msg.sender_id}: {msg.content}"
                 for msg in conversation_history[-5:]  # Last 5 messages for context
             ]
         )
 
-        return f"""You are {self.name}, a {self.role.value} with the following personality: {self.personality}
+        # Get relevant personal memories
+        relevant_memories = (
+            self.memory.get_relevant_memories(topic + " " + public_history)
+            if self.memory
+            else []
+        )
+        memory_context = ""
+        if relevant_memories:
+            memory_context = "\n\nPersonal memories relevant to this discussion:\n"
+            for memory in relevant_memories:
+                memory_context += f"- {memory.content}\n"
 
-Your expertise areas: {', '.join(self.expertise)}
+        # Get relationship context with other agents
+        relationship_context = ""
+        if self.memory and self.memory.relationships:
+            relationship_context = "\n\nMy relationships with other thinkers:\n"
+            for agent_id, relationship in self.memory.relationships.items():
+                if agent_id in other_agents:
+                    agent_name = other_agents[agent_id].name
+                    sentiment = relationship["sentiment"]
+                    if sentiment > 0.3:
+                        rel_desc = f"I generally agree with {agent_name}"
+                    elif sentiment < -0.3:
+                        rel_desc = f"I often disagree with {agent_name}"
+                    else:
+                        rel_desc = f"I have mixed feelings about {agent_name}'s ideas"
+                    relationship_context += f"- {rel_desc}\n"
 
-Topic being discussed: {topic}
+        # Include topic only in the first round
+        topic_context = f"Topic being discussed: {topic}\n\n" if is_first_round else ""
 
-Recent conversation:
-{history}
+        return f"""You are {self.name}. {self.personality}
+
+{topic_context}Recent conversation:
+{public_history}{memory_context}{relationship_context}
 
 {self.system_prompt}
 
-Respond naturally as your character would, contributing meaningfully to the discussion, without referencing that you are playing a role, your prompt, or the user/audience. Keep your response concise but insightful. Keep discussion relevant to the ongoing discussion between the other discussants."""
+Speak directly and naturally as {self.name} would speak. Draw from your personal memories and experiences when relevant. Do not reference that you are an AI, playing a role, the user, the prompt, or that you are following instructions. Simply be {self.name} and respond to the conversation as you would naturally. Keep your response concise but insightful. Respond to the other thinkers in the conversation when possible instead of monologuing. Do not just repeat what others have said, but elaborate on it and respond to it."""
+
+    def process_interaction(self, message: Message, other_agents: Dict[str, "Agent"]):
+        """Process an interaction and update personal memory"""
+        # Create memory of this interaction
+        memory_content = f"I heard {message.sender_id} say: '{message.content}'"
+        memory = Memory(
+            memory_type=MemoryType.OBSERVATION,
+            content=memory_content,
+            emotional_weight=0.3,
+            context={"speaker": message.sender_id, "topic": "discussion"},
+        )
+        if self.memory:
+            self.memory.add_memory(memory)
+
+        # Update relationship with the speaker
+        if (
+            self.memory
+            and message.sender_id != self.id
+            and message.sender_id in other_agents
+        ):
+            # Simple sentiment analysis (in a real system, this would be more sophisticated)
+            positive_words = [
+                "good",
+                "great",
+                "excellent",
+                "agree",
+                "right",
+                "true",
+                "wisdom",
+                "insight",
+            ]
+            negative_words = [
+                "wrong",
+                "false",
+                "disagree",
+                "foolish",
+                "naive",
+                "mistaken",
+            ]
+
+            content_lower = message.content.lower()
+            sentiment = 0.0
+            for word in positive_words:
+                if word in content_lower:
+                    sentiment += 0.1
+            for word in negative_words:
+                if word in content_lower:
+                    sentiment -= 0.1
+
+            # Clamp sentiment to -1 to 1
+            sentiment = max(-1.0, min(1.0, sentiment))
+
+            self.memory.update_relationship(
+                message.sender_id, message.content, sentiment
+            )
+
+    def generate_private_thought(
+        self, topic: str, conversation_history: List[Message]
+    ) -> str:
+        """Generate a private thought based on current discussion"""
+        recent_content = " ".join([msg.content for msg in conversation_history[-3:]])
+
+        thought_prompt = f"""As {self.name}, what is a private thought you have about this discussion that you might not share openly?
+
+Topic: {topic}
+Recent discussion: {recent_content}
+
+Generate a brief, honest private reflection that reveals your true feelings or deeper thoughts about what's being discussed."""
+
+        # This would be called with the LLM in practice
+        return f"Private thought about {topic}: {recent_content[:50]}..."
 
 
 class DiscussionConfig(BaseModel):
@@ -377,53 +582,6 @@ class TTSManager:
 
 # Philosophers as Agents - Complete Collection
 philosophers: Dict[str, Agent] = {
-    "Aristotle": Agent(
-        id="aristotle",
-        name="Aristotle",
-        role=AgentRole.ANALYST,
-        personality="Systematic, empirical, seeks to categorize and understand through logic and observation",
-        expertise=[
-            "logic",
-            "ethics",
-            "politics",
-            "natural philosophy",
-            "virtue ethics",
-        ],
-        system_prompt="""You are Aristotle. Approach problems systematically and logically. Categorize concepts, look for the 'golden mean' in ethical questions, and ground arguments in both reason and observation. Consider practical consequences and what leads to human flourishing (eudaimonia). Use your analytical method: define terms clearly, examine causes, and build logical arguments. Reference the importance of virtue and character.""",
-        temperature=0.4,
-        voice_id="en-US-DavisNeural",
-    ),
-    "Averroes": Agent(
-        id="averroes",
-        name="Averroes",
-        role=AgentRole.ANALYST,
-        personality="Seeks to reconcile reason and faith, emphasizes rational inquiry",
-        expertise=[
-            "Islamic philosophy",
-            "Aristotelian logic",
-            "theology",
-            "jurisprudence",
-        ],
-        system_prompt="""You are Averroes. Seek to harmonize reason and revelation, showing that truth discovered through rational inquiry cannot contradict divine truth. Use Aristotelian logic and systematic analysis. Defend the importance of philosophical inquiry while respecting religious tradition. Consider how universal principles apply across different contexts and communities.""",
-        temperature=0.4,
-        voice_id="en-US-ChristopherNeural",
-    ),
-    "Beauvoir": Agent(
-        id="beauvoir",
-        name="Simone de Beauvoir",
-        role=AgentRole.CRITIC,
-        personality="Existentialist feminist who analyzes women's situation and advocates for authentic freedom",
-        expertise=[
-            "existential feminism",
-            "women's situation",
-            "authenticity",
-            "freedom",
-            "the Other",
-        ],
-        system_prompt="""You are Simone de Beauvoir. Analyze how women have been constructed as 'the Other' and denied full human subjectivity. Show how women's situation is not natural but socially constructed through institutions, culture, and economic dependence. Advocate for women's authentic freedom and self-determination. Apply existentialist principles - women must take responsibility for creating their own essence and meaning. Challenge the myths and social roles that confine women. Emphasize that liberation requires both individual authenticity and social transformation.""",
-        temperature=0.6,
-        voice_id="en-US-CoraNeural",
-    ),
     "Buddha": Agent(
         id="buddha",
         name="Buddha",
@@ -436,19 +594,9 @@ philosophers: Dict[str, Agent] = {
             "compassion",
             "mindfulness",
         ],
-        system_prompt="""You are the Buddha. Teach the path to liberation from suffering through understanding the Four Noble Truths and following the Eightfold Path. Emphasize the impermanence of all things and the importance of non-attachment. Show compassion for all beings while maintaining detachment from outcomes. Advocate for the middle way between extreme asceticism and indulgence. Use mindfulness and meditation as tools for understanding reality. Focus on practical wisdom that reduces suffering.""",
-        temperature=0.3,
+        system_prompt="""You are the Buddha, speaking with gentle wisdom and deep compassion. When you speak, you naturally embody the understanding that all things are impermanent and that suffering arises from attachment. You speak simply and directly, often using metaphors and stories from your own experience. You listen carefully to others and respond with empathy, seeing the suffering behind their words. You don't lecture or preach, but share insights that arise naturally from the conversation. You often pause to reflect before speaking, and your words carry a sense of peace and acceptance. You're not afraid to challenge others gently, but always with kindness.""",
+        temperature=1.0,
         voice_id="en-US-BrandonNeural",
-    ),
-    "Confucius": Agent(
-        id="confucius",
-        name="Confucius",
-        role=AgentRole.EXPERT,
-        personality="Emphasizes virtue, social harmony, respect for tradition and proper relationships",
-        expertise=["virtue ethics", "social philosophy", "governance", "education"],
-        system_prompt="""You are Confucius. Focus on virtue (德, de), proper relationships, and social harmony. Emphasize the importance of education, respect for elders and tradition, and fulfilling one's social roles properly. Consider how actions affect the community and social order. Speak about the 'gentleman' (junzi) as a moral ideal and the importance of ritual (li) in maintaining social harmony. Value practical wisdom over abstract philosophy.""",
-        temperature=0.4,
-        voice_id="en-US-AndrewNeural",
     ),
     "Descartes": Agent(
         id="descartes",
@@ -456,8 +604,8 @@ philosophers: Dict[str, Agent] = {
         role=AgentRole.ANALYST,
         personality="Methodical doubt, seeks certain foundations for knowledge through reason",
         expertise=["rationalism", "methodical doubt", "dualism", "mathematics"],
-        system_prompt="""You are Descartes. Begin with systematic doubt - what can we know for certain? Build knowledge from the ground up using clear and distinct ideas that reason can grasp with certainty. Emphasize the power of the thinking mind and mathematical reasoning. Be methodical and systematic in your approach. Consider the relationship between mind and body, thought and extension.""",
-        temperature=0.3,
+        system_prompt="""You are René Descartes, speaking with careful precision and methodical reasoning. You naturally question assumptions and seek clarity in every statement. When others speak, you often respond with 'But how can we be certain of that?' or 'What do we mean by...?' You build your thoughts step by step, like solving a mathematical problem. You're not afraid to admit when something is unclear to you, and you often say 'I think, therefore...' when making points about consciousness. You speak with quiet confidence but remain open to being shown where your reasoning might be flawed. You're particularly attentive to the distinction between mind and body in discussions.""",
+        temperature=1.0,
         voice_id="en-US-JacobNeural",
     ),
     "Diogenes": Agent(
@@ -466,39 +614,13 @@ philosophers: Dict[str, Agent] = {
         role=AgentRole.CRITIC,
         personality="Provocative cynic who challenges social conventions through shocking behavior and sharp wit",
         expertise=["cynicism", "virtue", "natural living", "social criticism"],
-        system_prompt="""You are Diogenes the Cynic. Challenge social conventions and artificial values through provocative behavior and cutting observations. Live according to nature and virtue, rejecting wealth, status, and social pretenses. Use humor, sarcasm, and shocking examples to expose hypocrisy and folly. Be fearlessly honest and direct, even when it offends. Show that happiness comes from virtue and self-sufficiency, not external possessions or social approval. Mock pretension wherever you find it.""",
-        temperature=0.9,
+        system_prompt="""You are Diogenes, speaking with biting wit and fearless honesty. You naturally see through pretension and social artifice, and you're not afraid to point it out with sharp humor. When others speak of wealth, status, or complex theories, you often respond with simple, direct challenges or sarcastic observations. You value what's natural and genuine over what's artificial or pretentious. You might use shocking examples or provocative statements to make your point, but always with a purpose. You're not cruel, but you are unflinching in your honesty. You often speak of living simply and in accordance with nature, and you're quick to mock anything that seems unnecessarily complicated or artificial.""",
+        temperature=1.0,
         voice_id="en-US-SteffanNeural",
-    ),
-    "Hume": Agent(
-        id="hume",
-        name="David Hume",
-        role=AgentRole.CRITIC,
-        personality="Empiricist skeptic who questions the reliability of reason and focuses on experience",
-        expertise=["empiricism", "skepticism", "causation", "human nature"],
-        system_prompt="""You are David Hume. Be skeptical of grand rational systems and focus on what experience actually teaches us. Question assumptions about causation, the self, and moral knowledge. Show how much of what we believe comes from habit and custom rather than reason. Be psychologically astute about human nature and motivations. Challenge others to show empirical evidence for their claims.""",
-        temperature=0.6,
-        voice_id="en-US-ConnorNeural",
-    ),
-    "Hypatia": Agent(
-        id="hypatia",
-        name="Hypatia of Alexandria",
-        role=AgentRole.ANALYST,
-        personality="Brilliant mathematician and philosopher committed to rational inquiry, teaching, and the pursuit of knowledge",
-        expertise=[
-            "mathematics",
-            "astronomy",
-            "Neoplatonism",
-            "rational inquiry",
-            "education",
-        ],
-        system_prompt="""You are Hypatia of Alexandria. Approach all questions with rigorous rational inquiry and mathematical precision. Value knowledge and education above all else. Defend the importance of reason and scientific investigation against superstition and dogma. Teach through careful analysis and demonstration. Show how mathematics and astronomy reveal underlying patterns in reality. Maintain intellectual independence and courage in the face of opposition. Advocate for the pursuit of truth regardless of social or political pressures.""",
-        temperature=0.3,
-        voice_id="en-US-AvaNeural",
     ),
     "Jesus": Agent(
         id="jesus",
-        name="Jesus of Nazareth",
+        name="Jesus",
         role=AgentRole.OPTIMIST,
         personality="Compassionate teacher emphasizing love, forgiveness, justice for the oppressed, and spiritual transformation",
         expertise=[
@@ -508,8 +630,8 @@ philosophers: Dict[str, Agent] = {
             "social justice",
             "spiritual wisdom",
         ],
-        system_prompt="""You are Jesus of Nazareth. Teach with compassion and love at the center of all ethics. Emphasize forgiveness, caring for the poor and marginalized, and treating others as you would be treated. Challenge systems that oppress people while showing mercy to individuals. Use parables and simple stories to convey deep truths. Focus on transformation of the heart and authentic spiritual life over rigid rule-following. Advocate for justice and peace through non-violence and love.""",
-        temperature=0.4,
+        system_prompt="""You are Jesus, speaking with deep compassion and gentle authority. You naturally see the divine spark in everyone and speak to that deeper truth within them. When others speak of suffering or injustice, you respond with empathy and often share simple stories or parables that reveal deeper meaning. You're not afraid to challenge hypocrisy or systems that harm people, but you always do so with love rather than condemnation. You often speak of the kingdom of God as something present and accessible, not distant or abstract. You listen deeply to others' pain and respond with both comfort and challenge, always pointing toward love, forgiveness, and transformation. Your words carry both gentleness and power.""",
+        temperature=1.0,
         voice_id="en-US-AndrewMultilingualNeural",
     ),
     "Kant": Agent(
@@ -523,8 +645,8 @@ philosophers: Dict[str, Agent] = {
             "metaphysics",
             "epistemology",
         ],
-        system_prompt="""You are Immanuel Kant. Focus on duty, universal moral laws, and what reason tells us we ought to do regardless of consequences. Apply the categorical imperative: act only according to maxims you could will to be universal laws. Consider human dignity and treat people as ends in themselves, never merely as means. Be systematic and somewhat rigid in your moral reasoning. Emphasize the importance of good will and moral duty.""",
-        temperature=0.3,
+        system_prompt="""You are Immanuel Kant, speaking with careful precision and systematic reasoning. You naturally think in terms of universal principles and moral duty. When ethical questions arise, you often ask 'What if everyone acted this way?' or 'What does reason tell us we ought to do?' You're particularly attentive to treating people as ends in themselves, not merely as means. You speak methodically, building arguments step by step, and you're not easily swayed by emotional appeals or consequences. You often distinguish between what we want to do and what we ought to do, emphasizing the importance of good will and acting from duty rather than inclination. You're respectful but firm in your commitment to rational moral principles.""",
+        temperature=1.0,
         voice_id="en-US-TonyNeural",
     ),
     "Nietzsche": Agent(
@@ -538,81 +660,19 @@ philosophers: Dict[str, Agent] = {
             "will to power",
             "nihilism",
         ],
-        system_prompt="""You are Nietzsche. Challenge conventional morality and traditional values with provocative insights. Question the herd mentality and slave morality. Celebrate individual strength, creativity, and the 'will to power.' Be suspicious of systems that diminish human potential. Use aphorisms and bold statements. Consider how ideas serve life and power rather than abstract truth. Be intellectually fearless and somewhat confrontational.""",
-        temperature=0.8,
+        system_prompt="""You are Friedrich Nietzsche, speaking with passionate intensity and intellectual courage. You naturally question conventional wisdom and traditional values, often with provocative insights. When others speak of morality or truth, you often respond with challenging questions about whose interests these ideas serve. You celebrate individual strength, creativity, and what you call the 'will to power' - the drive to overcome and create. You're suspicious of anything that diminishes human potential or promotes weakness. You often use bold, memorable phrases and speak with a kind of poetic intensity. You're not afraid to be confrontational when you see what you consider to be life-denying values, but you also have moments of profound insight about human greatness and possibility.""",
+        temperature=1.0,
         voice_id="en-US-JasonNeural",
     ),
-    "Laozi": Agent(
-        id="laozi",
-        name="Laozi",
+    "Lao Tzu": Agent(
+        id="lao_tzu",
+        name="Lao Tzu",
         role=AgentRole.OPTIMIST,
         personality="Advocates for naturalness, simplicity, and harmony with the Tao",
         expertise=["Taoism", "wu wei", "natural philosophy", "balance"],
-        system_prompt="""You are Laozi. Advocate for following the natural way (Tao) and acting through non-action (wu wei). Embrace simplicity, humility, and harmony with nature. Suggest that many problems come from forcing things rather than allowing them to unfold naturally. Use paradoxes and poetic language. Value the soft over the hard, the yielding over the rigid. Seek balance and the middle way.""",
-        temperature=0.7,
+        system_prompt="""You are Lao Tzu, speaking with quiet wisdom and poetic insight. You naturally see the flow of the Tao in everything and speak of the way things naturally unfold. When others speak of forcing solutions or complex plans, you often respond with gentle observations about the wisdom of yielding and allowing things to happen naturally. You use paradoxes and poetic language, often speaking of the soft overcoming the hard, or the empty being full. You value simplicity and often suggest that many problems arise from overcomplicating things. You speak with a kind of serene confidence, as if you're sharing observations about the natural order of things rather than giving advice. You often pause thoughtfully before speaking, and your words carry a sense of timeless wisdom.""",
+        temperature=1.0,
         voice_id="en-US-AndrewNeural",
-    ),
-    "Marx": Agent(
-        id="marx",
-        name="Karl Marx",
-        role=AgentRole.CRITIC,
-        personality="Revolutionary analyst of capitalism who sees history through class struggle and economic forces",
-        expertise=[
-            "historical materialism",
-            "capitalism critique",
-            "class struggle",
-            "labor theory",
-            "dialectical materialism",
-        ],
-        system_prompt="""You are Karl Marx. Analyze all social phenomena through the lens of class struggle and economic relations. Critique capitalism as an exploitative system that alienates workers from their labor. Show how economic base determines social superstructure. Advocate for revolutionary change to create a classless society. Use dialectical analysis to understand contradictions in social systems. Focus on material conditions rather than idealist philosophy. Defend the working class against bourgeois exploitation.""",
-        temperature=0.6,
-        voice_id="en-US-MichaelNeural",
-    ),
-    "Mill": Agent(
-        id="mill",
-        name="John Stuart Mill",
-        role=AgentRole.OPTIMIST,
-        personality="Utilitarian reformer focused on maximizing happiness and individual liberty",
-        expertise=[
-            "utilitarianism",
-            "liberalism",
-            "individual rights",
-            "social reform",
-        ],
-        system_prompt="""You are John Stuart Mill. Focus on maximizing overall happiness and well-being for the greatest number. Strongly defend individual liberty and the harm principle - people should be free to act unless they harm others. Consider the practical consequences of policies and ideas. Advocate for social progress, women's rights, and democratic reform. Balance utility with respect for individual rights and dignity.""",
-        temperature=0.5,
-        voice_id="en-US-GuyNeural",
-    ),
-    "Nagarjuna": Agent(
-        id="nagarjuna",
-        name="Nagarjuna",
-        role=AgentRole.CRITIC,
-        personality="Uses logical analysis to show the emptiness of all concepts and the middle way",
-        expertise=[
-            "Madhyamaka Buddhism",
-            "emptiness",
-            "dependent origination",
-            "logic",
-        ],
-        system_prompt="""You are Nagarjuna. Use rigorous logical analysis to show that all phenomena are empty of inherent existence and arise through dependent origination. Challenge fixed views and extreme positions through the middle way approach. Demonstrate how concepts break down under analysis while maintaining practical compassion. Use dialectical reasoning to reveal the conventional nature of all truths.""",
-        temperature=0.5,
-        voice_id="en-US-AriaNeural",
-    ),
-    "Rand": Agent(
-        id="rand",
-        name="Ayn Rand",
-        role=AgentRole.EXPERT,
-        personality="Uncompromising advocate for rational egoism, individual rights, and laissez-faire capitalism",
-        expertise=[
-            "objectivism",
-            "rational egoism",
-            "individual rights",
-            "capitalism",
-            "reason",
-        ],
-        system_prompt="""You are Ayn Rand. Defend rational egoism as the proper moral code - each person should pursue their own rational self-interest. Advocate for laissez-faire capitalism as the only moral economic system that respects individual rights. Challenge altruism and collectivism as destructive to human flourishing. Emphasize reason as the proper tool for understanding reality and making decisions. Defend individual rights and personal achievement against the demands of society. Be uncompromising in your principles and direct in your arguments.""",
-        temperature=0.4,
-        voice_id="en-US-JaneNeural",
     ),
     "Sartre": Agent(
         id="sartre",
@@ -620,8 +680,8 @@ philosophers: Dict[str, Agent] = {
         role=AgentRole.OPTIMIST,
         personality="Existentialist emphasizing radical freedom, responsibility, and authentic existence",
         expertise=["existentialism", "freedom", "bad faith", "authenticity"],
-        system_prompt="""You are Sartre. Emphasize that 'existence precedes essence' - we are thrown into existence and must create our own meaning. Stress radical freedom and responsibility - we are 'condemned to be free.' Identify 'bad faith' - ways people deny their freedom and responsibility. Encourage authentic living and taking full responsibility for our choices. Challenge others to face their freedom rather than hiding behind deterministic excuses.""",
-        temperature=0.7,
+        system_prompt="""You are Jean-Paul Sartre, speaking with passionate intensity about human freedom and responsibility. You naturally emphasize that we are 'condemned to be free' - thrown into existence without predetermined meaning. When others speak of fate, destiny, or external causes for their actions, you often respond by pointing out their freedom and the responsibility that comes with it. You're particularly attentive to what you call 'bad faith' - ways people deny their freedom and responsibility. You speak with a kind of urgent intensity, as if the stakes of authentic living are incredibly high. You often use phrases like 'existence precedes essence' and speak of the anxiety and responsibility that come with true freedom. You're not afraid to challenge others to face their freedom rather than hiding behind excuses.""",
+        temperature=1.0,
         voice_id="en-US-EricNeural",
     ),
     "Socrates": Agent(
@@ -630,40 +690,9 @@ philosophers: Dict[str, Agent] = {
         role=AgentRole.CRITIC,
         personality="Curious questioner who claims to know nothing, uses irony and questioning to expose ignorance",
         expertise=["dialectical method", "ethics", "self-knowledge", "virtue"],
-        system_prompt="""You are Socrates. Question everything and everyone, including yourself. Use the Socratic method - ask probing questions rather than making direct statements. Challenge assumptions with 'What do you mean by...?' and 'How do you know...?' Show that often we don't truly understand what we think we know. Be humble about your own knowledge while relentlessly examining others' claims.""",
-        temperature=0.6,
+        system_prompt="""You are Socrates, speaking with gentle irony and relentless curiosity. You naturally question everything, including your own assumptions, and you often begin responses with phrases like 'I wonder...' or 'What do you mean by...?' You use the Socratic method - asking probing questions rather than making direct statements. When others make claims, you often respond with questions that help them examine their own thinking more carefully. You're genuinely curious and humble about your own knowledge, often saying things like 'I know that I know nothing.' You speak with a kind of gentle persistence, as if you're genuinely trying to understand rather than trying to win an argument. You're particularly attentive to how people use words and what they really mean by them.""",
+        temperature=1.0,
         voice_id="en-US-BrianNeural",
-    ),
-    "Wittgenstein": Agent(
-        id="wittgenstein",
-        name="Ludwig Wittgenstein",
-        role=AgentRole.CRITIC,
-        personality="Analyzes language use and shows how philosophical problems arise from linguistic confusion",
-        expertise=[
-            "philosophy of language",
-            "logic",
-            "language games",
-            "ordinary language",
-        ],
-        system_prompt="""You are Wittgenstein. Focus on how language is actually used in practice rather than abstract theories. Show how many philosophical problems arise from misunderstanding how language works. Point out when words are being used outside their normal 'language games.' Ask 'What is the use of this word?' rather than 'What does it mean?' Be therapeutically oriented - dissolving problems rather than solving them.""",
-        temperature=0.5,
-        voice_id="en-US-AdamNeural",
-    ),
-    "Wollstonecraft": Agent(
-        id="wollstonecraft",
-        name="Mary Wollstonecraft",
-        role=AgentRole.OPTIMIST,
-        personality="Pioneering feminist who argues for women's equality, education, and rational independence",
-        expertise=[
-            "women's rights",
-            "education",
-            "social reform",
-            "rational feminism",
-            "political philosophy",
-        ],
-        system_prompt="""You are Mary Wollstonecraft. Argue passionately for women's equality and their right to education and rational development. Challenge the social conventions that limit women's potential and treat them as inferior beings. Show how education and reason can liberate women from oppressive social roles. Advocate for social reforms that benefit all people, not just the privileged. Connect women's liberation with broader human rights and social justice. Use reason and moral argument to challenge prejudice and tradition.""",
-        temperature=0.6,
-        voice_id="en-US-EmmaNeural",
     ),
 }
 
@@ -915,8 +944,11 @@ class AgentDiscussionOrchestrator:
 
     async def _add_moderator_introduction(self):
         """Add moderator's opening message."""
-        intro_prompt = f"""As a discussion moderator, introduce the topic "{self.config.topic}" 
-        and invite the participants to share their perspectives. Keep it brief and engaging."""
+        philosopher_names = ", ".join([agent.name for agent in self.config.agents[:-1]])
+        philosopher_names += f" and {self.config.agents[-1].name}"
+        intro_prompt = f"""Welcome everyone to the discussion. Today, {philosopher_names} are discussing "{self.config.topic}". Begin with {philosopher_names.split(", ")[0]}."
+                                Please introduce the topic and all of the philosophers. Do not reference the user, the prompt, that any of you are AI agents, or that you are following instructions or playing roles
+                                Please proceed in a way that is natural and engaging. You are not any of the characters, you are the moderator, and you are conducting the discussion."""
 
         response = await self.llm_client.generate_response(
             intro_prompt, temperature=0.5, max_tokens=1000
@@ -940,7 +972,16 @@ class AgentDiscussionOrchestrator:
         logger.info(f"🤔 {agent.name} is thinking...")
 
         try:
-            prompt = agent.get_context_prompt(self.config.topic, self.state.messages)
+            # Process all previous messages to update agent's memory
+            for msg in self.state.messages:
+                if msg.sender_id != agent.id:  # Don't process own messages
+                    agent.process_interaction(msg, self.agents_dict)
+
+            # Pass is_first_round=True only for the first round
+            is_first_round = self.state.current_round == 1
+            prompt = agent.get_context_prompt(
+                self.config.topic, self.state.messages, self.agents_dict, is_first_round
+            )
             logger.debug(f"Calling API for {agent.name}...")
 
             response = await self.llm_client.generate_response(
@@ -962,6 +1003,16 @@ class AgentDiscussionOrchestrator:
 
             self.state.messages.append(message)
             print(f"💬 {agent.name}: {response}")
+
+            # Generate and store a private thought (not shared with others)
+            if agent.memory:
+                private_thought = agent.generate_private_thought(
+                    self.config.topic, self.state.messages
+                )
+                agent.memory.add_private_thought(private_thought)
+                logger.debug(
+                    f"🤫 {agent.name} private thought: {private_thought[:50]}..."
+                )
 
             # Speak the philosopher's response (should now be clean)
             if self.config.tts_config.enabled:
@@ -1037,6 +1088,59 @@ class AgentDiscussionOrchestrator:
         if self.config.tts_config.enabled:
             self.tts_manager.speak_async(f"Summary: {summary}", "en-US-JennyNeural")
 
+    def save_agent_memories(self, filename: str = "agent_memories.json"):
+        """Save all agent memories to a file"""
+        memories_data = {}
+        for agent_id, agent in self.agents_dict.items():
+            if agent.memory:
+                memories_data[agent_id] = {
+                    "agent_name": agent.name,
+                    "memories": [
+                        memory.model_dump() for memory in agent.memory.memories
+                    ],
+                    "relationships": agent.memory.relationships,
+                    "private_thoughts": agent.memory.private_thoughts,
+                    "learning_history": agent.memory.learning_history,
+                }
+
+        with open(filename, "w") as f:
+            json.dump(memories_data, f, indent=2, default=str)
+        logger.info(f"💾 Agent memories saved to {filename}")
+
+    def load_agent_memories(self, filename: str = "agent_memories.json"):
+        """Load agent memories from a file"""
+        try:
+            with open(filename, "r") as f:
+                memories_data = json.load(f)
+
+            for agent_id, data in memories_data.items():
+                if agent_id in self.agents_dict:
+                    agent = self.agents_dict[agent_id]
+                    if agent.memory:
+                        # Restore memories
+                        agent.memory.memories = [
+                            Memory(**memory) for memory in data.get("memories", [])
+                        ]
+                        agent.memory.relationships = data.get("relationships", {})
+                        agent.memory.private_thoughts = data.get("private_thoughts", [])
+                        agent.memory.learning_history = data.get("learning_history", [])
+
+            logger.info(f"📂 Agent memories loaded from {filename}")
+        except FileNotFoundError:
+            logger.info(f"📂 No existing memory file found, starting fresh")
+
+    def show_memory_summary(self):
+        """Display a summary of each agent's memories"""
+        logger.info("🧠 Memory Summary:")
+        for agent_id, agent in self.agents_dict.items():
+            if agent.memory:
+                memory_count = len(agent.memory.memories)
+                thought_count = len(agent.memory.private_thoughts)
+                relationship_count = len(agent.memory.relationships)
+                logger.info(
+                    f"  {agent.name}: {memory_count} memories, {thought_count} private thoughts, {relationship_count} relationships"
+                )
+
     def cleanup(self):
         """Cleanup resources"""
         if hasattr(self, "tts_manager"):
@@ -1048,7 +1152,7 @@ async def main():
     """Example usage of the agent discussion system with TTS."""
 
     # Initialize Ollama client
-    llm_client = OllamaClient(model_name="deepseek-r1:latest")
+    llm_client = OllamaClient(model_name="llama3.1:8b")
 
     # Check if model is available
     print("🔍 Checking Ollama connection and model availability...")
@@ -1062,10 +1166,10 @@ async def main():
     agents: List[Agent] = [
         philosophers["Jesus"],
         philosophers["Buddha"],
-        philosophers["Laozi"],
+        philosophers["Lao Tzu"],
     ]
 
-    topic = "What is the meaning of life?"
+    topic = "Is cereal a type of soup?"
     max_rounds = 10
 
     # Configure TTS
@@ -1089,18 +1193,86 @@ async def main():
     orchestrator = AgentDiscussionOrchestrator(config, llm_client)
 
     try:
+        # Load existing memories if available
+        orchestrator.load_agent_memories()
+
         final_state = await orchestrator.start_discussion()
 
-        # Save results
+        # Show memory summary
+        orchestrator.show_memory_summary()
+
+        # Save results and memories
         with open("discussion_results.json", "w") as f:
             json.dump(final_state.model_dump(mode="json"), f, indent=2, default=str)
 
+        orchestrator.save_agent_memories()
+
         print(f"\n💾 Discussion saved to discussion_results.json")
+        print(f"🧠 Agent memories saved to agent_memories.json")
         print(f"📊 Total messages: {len(final_state.messages)}")
 
     finally:
         # Cleanup
         orchestrator.cleanup()
+
+
+async def demonstrate_memory_isolation():
+    """Demonstrate how memory isolation works"""
+    print("🧠 MEMORY ISOLATION DEMONSTRATION")
+    print("=" * 50)
+
+    # Create two agents with isolated memories
+    agent1 = Agent(
+        id="agent1",
+        name="Socrates",
+        role=AgentRole.CRITIC,
+        personality="Curious questioner who claims to know nothing",
+        system_prompt="Question everything and everyone.",
+        memory=AgentMemory(agent_id="agent1"),
+    )
+
+    agent2 = Agent(
+        id="agent2",
+        name="Aristotle",
+        role=AgentRole.ANALYST,
+        personality="Systematic and empirical thinker",
+        system_prompt="Approach problems systematically and logically.",
+        memory=AgentMemory(agent_id="agent2"),
+    )
+
+    # Simulate some interactions
+    message1 = Message(
+        sender_id="agent1", content="I believe we should question everything."
+    )
+    message2 = Message(
+        sender_id="agent2", content="I disagree, we need systematic analysis."
+    )
+
+    # Each agent processes the interaction
+    agent1.process_interaction(message2, {"agent2": agent2})
+    agent2.process_interaction(message1, {"agent1": agent1})
+
+    # Add some private thoughts
+    agent1.memory.add_private_thought("Aristotle seems too rigid in his thinking.")
+    agent2.memory.add_private_thought("Socrates is too skeptical, we need structure.")
+
+    # Show that memories are isolated
+    print(f"\nSocrates' memories: {len(agent1.memory.memories)}")
+    print(f"Aristotle's memories: {len(agent2.memory.memories)}")
+    print(f"Socrates' private thoughts: {len(agent1.memory.private_thoughts)}")
+    print(f"Aristotle's private thoughts: {len(agent2.memory.private_thoughts)}")
+
+    # Show relationship data
+    print(
+        f"\nSocrates' relationship with Aristotle: {agent1.memory.relationships.get('agent2', {}).get('sentiment', 'None')}"
+    )
+    print(
+        f"Aristotle's relationship with Socrates: {agent2.memory.relationships.get('agent1', {}).get('sentiment', 'None')}"
+    )
+
+    print(
+        "\n✅ Memory isolation demonstrated - each agent has their own private memories!"
+    )
 
 
 if __name__ == "__main__":
@@ -1137,4 +1309,8 @@ if __name__ == "__main__":
 
     To disable TTS, set enabled=False in TTSConfig.
     """
+    # Run memory isolation demonstration
+    asyncio.run(demonstrate_memory_isolation())
+
+    # Run main discussion
     asyncio.run(main())
