@@ -1065,15 +1065,8 @@ class AgentDiscussionOrchestrator:
             self.state.messages.append(message)
             print(f"💬 {agent.name}: {response}")
 
-            # Generate and store a private thought (not shared with others)
-            if agent.memory:
-                private_thought = await self._generate_private_thought(agent)
-                agent.memory.add_private_thought(private_thought)
-                logger.debug(
-                    f"🤫 {agent.name} private thought: {private_thought[:50]}..."
-                )
-
-            # Speak the philosopher's response (should now be clean)
+            # Queue TTS immediately so audio starts playing in the background
+            # while we do the private-thought LLM call and prep the next agent.
             if self.config.tts_config.enabled:
                 speech_text = f"{agent.name}: {response}"
                 logger.debug(
@@ -1081,17 +1074,13 @@ class AgentDiscussionOrchestrator:
                 )
                 self.tts_manager.speak_async(speech_text, agent.voice_id)
 
-                # Wait for current speech to start and give it time to play
-                logger.debug(f"⏳ Waiting for {agent.name}'s speech to play...")
-
-                # Wait longer to ensure this agent's speech completes before next agent
-                await asyncio.sleep(3.0)  # Much longer delay
-
-                # Double-check TTS queue status
-                queue_size = self.tts_manager.tts_queue.qsize()
-                is_speaking = self.tts_manager.is_speaking
+            # Generate and store a private thought (not shared with others).
+            # Runs concurrently with TTS playback above.
+            if agent.memory:
+                private_thought = await self._generate_private_thought(agent)
+                agent.memory.add_private_thought(private_thought)
                 logger.debug(
-                    f"After {agent.name} - Queue: {queue_size}, Speaking: {is_speaking}"
+                    f"🤫 {agent.name} private thought: {private_thought[:50]}..."
                 )
 
         except Exception as e:
@@ -1113,7 +1102,6 @@ class AgentDiscussionOrchestrator:
                 self.tts_manager.speak_async(
                     f"{agent.name}: {fallback_response}", agent.voice_id
                 )
-                await asyncio.sleep(3.0)
 
     async def _generate_private_thought(self, agent: Agent) -> str:
         """Ask the LLM for an in-character private reflection from the agent."""
