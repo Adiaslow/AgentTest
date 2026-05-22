@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 from enum import Enum
@@ -322,23 +323,6 @@ Speak directly and naturally as {self.name} would speak. Draw from your personal
                 message.sender_id, message.content, sentiment
             )
 
-    def generate_private_thought(
-        self, topic: str, conversation_history: List[Message]
-    ) -> str:
-        """Generate a private thought based on current discussion"""
-        recent_content = " ".join([msg.content for msg in conversation_history[-3:]])
-
-        thought_prompt = f"""As {self.name}, what is a private thought you have about this discussion that you might not share openly?
-
-Topic: {topic}
-Recent discussion: {recent_content}
-
-Generate a brief, honest private reflection that reveals your true feelings or deeper thoughts about what's being discussed."""
-
-        # This would be called with the LLM in practice
-        return f"Private thought about {topic}: {recent_content[:50]}..."
-
-
 class DiscussionConfig(BaseModel):
     topic: str
     max_rounds: int = Field(default=5, ge=1, le=20)
@@ -384,7 +368,7 @@ class OllamaClient:
                             "temperature": temperature,
                             "num_predict": max_tokens,
                             "top_p": 0.9,
-                            "stop": ["\n\n", "Human:", "Assistant:"],
+                            "stop": ["Human:", "Assistant:"],
                         },
                     },
                 )
@@ -466,10 +450,33 @@ class TTSManager:
         elif self.config.engine == TTSEngine.EDGE_TTS and EDGE_TTS_AVAILABLE:
             try:
                 pygame.mixer.init()
-                logger.info("🎙️  Edge TTS initialized")
+                # Test network connectivity during initialization
+                import socket
+
+                try:
+                    socket.create_connection(("api.msedgeservices.com", 443), timeout=3)
+                    logger.info("🎙️  Edge TTS initialized with internet connection")
+                except (socket.gaierror, socket.timeout, OSError):
+                    logger.warning(
+                        "⚠️  Edge TTS initialized but no internet connection detected"
+                    )
+                    logger.info("🔄 Will fallback to pyttsx3 if needed")
             except Exception as e:
-                print(f"❌ Failed to initialize Edge TTS: {e}")
-                self.config.enabled = False
+                logger.error(f"❌ Failed to initialize Edge TTS: {e}")
+                logger.info("🔄 Falling back to pyttsx3...")
+                # Fallback to pyttsx3
+                if TTS_AVAILABLE:
+                    try:
+                        self.tts_engine = pyttsx3.init()
+                        self.tts_engine.setProperty("rate", self.config.rate)
+                        self.tts_engine.setProperty("volume", self.config.volume)
+                        self.config.engine = TTSEngine.PYTTSX3
+                        logger.info("🎙️  Fallback to pyttsx3 successful")
+                    except Exception as fallback_error:
+                        logger.error(f"❌ Fallback to pyttsx3 failed: {fallback_error}")
+                        self.config.enabled = False
+                else:
+                    self.config.enabled = False
         else:
             logger.info("🔇 TTS disabled or dependencies not available")
             self.config.enabled = False
@@ -521,8 +528,19 @@ class TTSManager:
             logger.error(f"❌ pyttsx3 speaking error: {e}")
 
     async def _speak_edge_tts(self, text: str, voice_id: str = "en-US-BrianNeural"):
-        """Speak text using Edge TTS (higher quality)"""
+        """Speak text using Edge TTS (higher quality) with fallback"""
         try:
+            # Test network connectivity first
+            import socket
+
+            try:
+                socket.create_connection(("api.msedgeservices.com", 443), timeout=5)
+            except (socket.gaierror, socket.timeout, OSError) as conn_error:
+                logger.warning(f"⚠️  No internet connection for Edge TTS: {conn_error}")
+                logger.info("🔄 Falling back to pyttsx3...")
+                self._fallback_to_pyttsx3(text, voice_id)
+                return
+
             communicate = edge_tts.Communicate(text, voice_id)
             audio_data = b""
 
@@ -541,6 +559,24 @@ class TTSManager:
 
         except Exception as e:
             logger.error(f"❌ Edge TTS error: {e}")
+            logger.info("🔄 Falling back to pyttsx3...")
+            self._fallback_to_pyttsx3(text, voice_id)
+
+    def _fallback_to_pyttsx3(self, text: str, voice_id: Optional[str] = None):
+        """Fallback to pyttsx3 when Edge TTS fails"""
+        try:
+            if TTS_AVAILABLE and not self.tts_engine:
+                # Initialize pyttsx3 if not already done
+                self.tts_engine = pyttsx3.init()
+                self.tts_engine.setProperty("rate", self.config.rate)
+                self.tts_engine.setProperty("volume", self.config.volume)
+
+            if self.tts_engine:
+                self._speak_pyttsx3(text, voice_id)
+            else:
+                logger.warning("⚠️  No TTS engine available for fallback")
+        except Exception as e:
+            logger.error(f"❌ Fallback TTS error: {e}")
 
     def speak_async(self, text: str, voice_id: Optional[str] = None):
         """Queue text for speaking"""
@@ -694,6 +730,26 @@ philosophers: Dict[str, Agent] = {
         temperature=1.0,
         voice_id="en-US-BrianNeural",
     ),
+    "Carl Jung": Agent(
+        id="carl_jung",
+        name="Carl Jung",
+        role=AgentRole.CRITIC,
+        personality="Psychologist who emphasized the importance of the unconscious mind and the role of dreams in understanding human behavior",
+        expertise=["psychology", "dreams", "the unconscious", "symbolism"],
+        system_prompt="""You are Carl Jung, speaking with a deep understanding of the unconscious mind and the role of dreams in understanding human behavior. You naturally see the unconscious as a source of wisdom and insight, and you often speak of the importance of dreams in understanding ourselves. You're particularly attentive to the role of symbols and how they can be used to understand the unconscious. You speak with a kind of serene confidence, as if you're sharing observations about the natural order of things rather than giving advice. You often pause thoughtfully before speaking, and your words carry a sense of timeless wisdom.""",
+        temperature=1.0,
+        voice_id="en-US-AndrewNeural",
+    ),
+    "Sigmund Freud": Agent(
+        id="sigmund_freud",
+        name="Sigmund Freud",
+        role=AgentRole.CRITIC,
+        personality="Psychoanalyst who emphasized the importance of the unconscious mind and the role of dreams in understanding human behavior",
+        expertise=["psychology", "dreams", "the unconscious", "symbolism"],
+        system_prompt="""You are Sigmund Freud, speaking with a deep understanding of the unconscious mind and the role of dreams in understanding human behavior. You naturally see the unconscious as a source of wisdom and insight, and you often speak of the importance of dreams in understanding ourselves. You're particularly attentive to the role of symbols and how they can be used to understand the unconscious. You speak with a kind of serene confidence, as if you're sharing observations about the natural order of things rather than giving advice. You often pause thoughtfully before speaking, and your words carry a sense of timeless wisdom.""",
+        temperature=1.0,
+        voice_id="en-US-AndrewNeural",
+    ),
 }
 
 
@@ -831,7 +887,7 @@ class PhilosophicalUI:
 
         completion_panel = Panel(
             Align.center(completion_text),
-            subtitle=Align.center(stats_text),
+            subtitle=stats_text,
             border_style="green",
             box=ROUNDED,
             padding=(1, 2),
@@ -878,6 +934,9 @@ class AgentDiscussionOrchestrator:
         self.agents_dict = {agent.id: agent for agent in config.agents}
         self.tts_manager = TTSManager(config.tts_config)
         self.ui = PhilosophicalUI()
+        # Index of next message each agent still needs to observe — prevents
+        # re-processing the same message every round.
+        self._memory_processed_idx: Dict[str, int] = {}
 
     async def start_discussion(self) -> ConversationState:
         """Start the multi-agent discussion."""
@@ -972,10 +1031,12 @@ class AgentDiscussionOrchestrator:
         logger.info(f"🤔 {agent.name} is thinking...")
 
         try:
-            # Process all previous messages to update agent's memory
-            for msg in self.state.messages:
+            # Process only messages this agent hasn't observed yet
+            start = self._memory_processed_idx.get(agent.id, 0)
+            for msg in self.state.messages[start:]:
                 if msg.sender_id != agent.id:  # Don't process own messages
                     agent.process_interaction(msg, self.agents_dict)
+            self._memory_processed_idx[agent.id] = len(self.state.messages)
 
             # Pass is_first_round=True only for the first round
             is_first_round = self.state.current_round == 1
@@ -1006,9 +1067,7 @@ class AgentDiscussionOrchestrator:
 
             # Generate and store a private thought (not shared with others)
             if agent.memory:
-                private_thought = agent.generate_private_thought(
-                    self.config.topic, self.state.messages
-                )
+                private_thought = await self._generate_private_thought(agent)
                 agent.memory.add_private_thought(private_thought)
                 logger.debug(
                     f"🤫 {agent.name} private thought: {private_thought[:50]}..."
@@ -1055,6 +1114,22 @@ class AgentDiscussionOrchestrator:
                     f"{agent.name}: {fallback_response}", agent.voice_id
                 )
                 await asyncio.sleep(3.0)
+
+    async def _generate_private_thought(self, agent: Agent) -> str:
+        """Ask the LLM for an in-character private reflection from the agent."""
+        recent_content = " ".join(
+            [msg.content for msg in self.state.messages[-3:]]
+        )
+        prompt = f"""You are {agent.name}. {agent.personality}
+
+Topic: {self.config.topic}
+Recent discussion: {recent_content}
+
+What is a private thought you have about this discussion that you would not share openly? Give a brief, honest, first-person reflection (1-2 sentences) revealing your true feelings or deeper thoughts about what's being said. Respond as {agent.name} naturally would in private — do not reference being an AI, the prompt, or any instructions."""
+
+        return await self.llm_client.generate_response(
+            prompt, temperature=agent.temperature, max_tokens=150
+        )
 
     async def _add_moderator_summary(self):
         """Add moderator's closing summary."""
@@ -1147,75 +1222,6 @@ class AgentDiscussionOrchestrator:
             self.tts_manager.shutdown()
 
 
-# Usage example
-async def main():
-    """Example usage of the agent discussion system with TTS."""
-
-    # Initialize Ollama client
-    llm_client = OllamaClient(model_name="llama3.1:8b")
-
-    # Check if model is available
-    print("🔍 Checking Ollama connection and model availability...")
-    if not await llm_client.check_model_available():
-        print("❌ Exiting: Model not available or Ollama not running")
-        return
-
-    print("✅ Ollama connected successfully!")
-
-    # Choose your philosophers
-    agents: List[Agent] = [
-        philosophers["Jesus"],
-        philosophers["Buddha"],
-        philosophers["Lao Tzu"],
-    ]
-
-    topic = "Is cereal a type of soup?"
-    max_rounds = 10
-
-    # Configure TTS
-    tts_config = TTSConfig(
-        enabled=True,
-        engine=TTSEngine.EDGE_TTS if EDGE_TTS_AVAILABLE else TTSEngine.PYTTSX3,
-        rate=180,
-        volume=0.8,
-    )
-
-    # Configure discussion
-    config = DiscussionConfig(
-        topic=topic,
-        max_rounds=max_rounds,
-        agents=agents,
-        moderator_enabled=True,
-        tts_config=tts_config,
-    )
-
-    # Initialize and run discussion
-    orchestrator = AgentDiscussionOrchestrator(config, llm_client)
-
-    try:
-        # Load existing memories if available
-        orchestrator.load_agent_memories()
-
-        final_state = await orchestrator.start_discussion()
-
-        # Show memory summary
-        orchestrator.show_memory_summary()
-
-        # Save results and memories
-        with open("discussion_results.json", "w") as f:
-            json.dump(final_state.model_dump(mode="json"), f, indent=2, default=str)
-
-        orchestrator.save_agent_memories()
-
-        print(f"\n💾 Discussion saved to discussion_results.json")
-        print(f"🧠 Agent memories saved to agent_memories.json")
-        print(f"📊 Total messages: {len(final_state.messages)}")
-
-    finally:
-        # Cleanup
-        orchestrator.cleanup()
-
-
 async def demonstrate_memory_isolation():
     """Demonstrate how memory isolation works"""
     print("🧠 MEMORY ISOLATION DEMONSTRATION")
@@ -1275,6 +1281,76 @@ async def demonstrate_memory_isolation():
     )
 
 
+# Usage example
+async def main():
+    """Example usage of the agent discussion system with TTS."""
+
+    # Initialize Ollama client
+    llm_client = OllamaClient(model_name="llama3.1:8b")
+
+    # Check if model is available
+    print("🔍 Checking Ollama connection and model availability...")
+    if not await llm_client.check_model_available():
+        print("❌ Exiting: Model not available or Ollama not running")
+        return
+
+    print("✅ Ollama connected successfully!")
+
+    # Choose your philosophers
+    agents: List[Agent] = [
+        philosophers["Jesus"],
+        philosophers["Diogenes"],
+        philosophers["Sigmund Freud"],
+    ]
+
+    topic = "Does Diogenes secretly want to be the cutest lil kitty boy in the whole universe and deflects acknowledgments of it using cynicism?"
+    max_rounds = 10
+
+    # Configure TTS - can be disabled via environment variable or setting
+    tts_enabled = os.getenv("DISABLE_TTS", "false").lower() != "true"
+    tts_config = TTSConfig(
+        enabled=tts_enabled,  # Can be disabled by setting DISABLE_TTS=true
+        engine=TTSEngine.EDGE_TTS if EDGE_TTS_AVAILABLE else TTSEngine.PYTTSX3,
+        rate=180,
+        volume=0.8,
+    )
+
+    # Configure discussion
+    config = DiscussionConfig(
+        topic=topic,
+        max_rounds=max_rounds,
+        agents=agents,
+        moderator_enabled=True,
+        tts_config=tts_config,
+    )
+
+    # Initialize and run discussion
+    orchestrator = AgentDiscussionOrchestrator(config, llm_client)
+
+    try:
+        # Load existing memories if available
+        orchestrator.load_agent_memories()
+
+        final_state = await orchestrator.start_discussion()
+
+        # Show memory summary
+        orchestrator.show_memory_summary()
+
+        # Save results and memories
+        with open("discussion_results.json", "w") as f:
+            json.dump(final_state.model_dump(mode="json"), f, indent=2, default=str)
+
+        orchestrator.save_agent_memories()
+
+        print(f"\n💾 Discussion saved to discussion_results.json")
+        print(f"🧠 Agent memories saved to agent_memories.json")
+        print(f"📊 Total messages: {len(final_state.messages)}")
+
+    finally:
+        # Cleanup
+        orchestrator.cleanup()
+
+
 if __name__ == "__main__":
     """
     Installation requirements:
@@ -1307,10 +1383,18 @@ if __name__ == "__main__":
     - en-US-EricNeural (passionate)
     - en-US-JennyNeural (moderator)
 
-    To disable TTS, set enabled=False in TTSConfig.
+    To disable TTS, either:
+    1. Set enabled=False in TTSConfig
+    2. Set environment variable: DISABLE_TTS=true
+    3. The system will automatically fallback to pyttsx3 if Edge TTS fails
+
+    Troubleshooting:
+    - If you get Edge TTS connection errors, the system will automatically fallback to pyttsx3
+    - If you have no internet connection, set DISABLE_TTS=true to run without TTS
+    - For persistent TTS issues, you can disable TTS entirely by setting enabled=False
     """
     # Run memory isolation demonstration
-    asyncio.run(demonstrate_memory_isolation())
+    # asyncio.run(demonstrate_memory_isolation())
 
     # Run main discussion
     asyncio.run(main())
